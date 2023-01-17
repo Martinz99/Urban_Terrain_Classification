@@ -1,0 +1,157 @@
+// This is a code to classify selected urban classes on google earth engine
+// The code must be ran from earth engine editor platform
+// Manual feature collection in the google earth platform is required for the code to work.
+
+
+//SENTINEL CLOUD MASKING
+function maskS2clouds (image) {
+  var qa = image.select('QA60');
+  
+  //Bits 10 and 11 are clouds and cirrus respectively
+  var cloudBitMask = 1 << 10;
+  var cirrusBitMask = 1 << 11;
+  
+  //Both flags should be set to zero, indicating clear conditions
+  var mask = qa.bitwiseAnd(cloudBitMask).eq(0)
+      .and(qa.bitwiseAnd(cirrusBitMask).eq(0));
+      
+  return image.updateMask(mask).divide(10000);
+  
+}
+
+//FILTERING IMAGE COLLECTION
+var sentinel_2 = ee.ImageCollection('COPERNICUS/S2') //performs image collection using using sentinel-2 
+                  .filterDate('2019-01-01', '2019-12-31')  //takes only images from within this period
+                  .filter(ee.Filter.lt('CLOUDY_PIXEL_PERCENTAGE', 20))  //removes images with high cloudcover
+                  .filterBounds(ROI)  //filters image collection based on this region
+                  .map(maskS2clouds)
+                  .median(); //taking median of spectral values to reduce reflectance due to atmospheric conditions
+                  
+//IMAGE STYLE
+var rgbVis = {
+  min:0.004,
+  max: 0.39,
+  bands: ['B11', 'B8', 'B4']
+};
+
+//ADDITIONAL BANDS
+// Normalized Difference Vegetation Index (NDVI)
+var ndvi = sentinel_2.expression('(NIR - Red) / (NIR + Red)', {
+            'NIR': sentinel_2.select('B8'),
+            'Red': sentinel_2.select('B4')
+});
+
+//Normalized Difference Water Index (NDWI)
+var ndwi = sentinel_2.expression('(Green - NIR) / (Green + NIR)', {
+            'NIR': sentinel_2.select('B8'),
+            'Green': sentinel_2.select('B3')
+});
+
+//Soil Adjusted Vegetation Index(SAVI)
+var savi = sentinel_2.expression('((NIR - Red) / (NIR + Red + 0.5)) * (1.0 + 0.5)', {
+            'NIR': sentinel_2.select('B8'),
+            'Red': sentinel_2.select('B4')
+});
+
+//ADD ADDITIONAL BANDS TO FINAL IMAGE
+var final_image = sentinel_2.addBands(ndvi.rename('NDVI'))
+                            .addBands(ndwi.rename('NDWI'))
+                            .addBands(savi.rename('SAVI'));
+                            
+//BANDS FOR PREDICTION
+var bands = ['B2', 'B3', 'B4', 'B5', 'B8', 'B9', 'B11', 'NDVI', 'NDWI', 'SAVI'];
+
+
+Map.addLayer(final_image.clip(ROI), rgbVis, 'Image');
+
+//merging the feature collection samples
+var samples = buildings.merge(trees).merge(roads).merge(grass).merge(water);
+
+print(samples.size());
+
+//creating the final sample set
+var total_sample = final_image.select(bands).sampleRegions({
+  collection:samples,
+  properties: ['id'],
+  scale: 20
+});
+
+
+//BUILDING THE RANDOM FOREST CLASSIFIER
+var classifier = ee.Classifier.smileRandomForest(10).train({         // number of decision trees
+  features:total_sample,
+  classProperty: 'id',
+  inputProperties: bands
+}); 
+
+//BUILDING THE CART CLASSIFIER
+var crt_classifier = ee.Classifier.smileCart().train({        
+  features:total_sample,
+  classProperty: 'id',
+  inputProperties: bands
+}); 
+
+//PERFORMING CLASSIFICATION
+var classification = final_image.select(bands).classify(classifier);
+
+//Displaying the classified image using different colour code for each class
+Map.addLayer(classification, {palette: ["brown", "green",  "gray", "lime", "aqua"], min:0, max:4});
+
+
+//ACCURACY ASSESSMENT
+var sample_rc = total_sample.randomColumn('rand');
+
+var training = sample_rc.filter(ee.Filter.lt('rand', 0.7));  //70% for training
+var validation = sample_rc.filter(ee.Filter.gte('rand', 0.3));  //30% for validation
+
+var classifier = ee.Classifier.smileRandomForest(10).train({         // number of decision trees
+  features:training,
+  classProperty: 'id',
+  inputProperties: bands
+}); 
+
+//TRAINING METRICS FOR RF
+var confusionMatrix = ee.ConfusionMatrix(training.classify(classifier)
+                      .errorMatrix({
+                        actual: 'id',
+                        predicted: 'classification'
+                      }));
+print('RF Training Confusion Matrix', confusionMatrix);
+print('RF Overall Training Accuracy', confusionMatrix.accuracy());
+
+//VALIDATION METRICS FOR RF
+var confusionMatrix = ee.ConfusionMatrix(validation.classify(classifier)
+                      .errorMatrix({
+                        actual: 'id',
+                        predicted: 'classification'
+                      }));
+                  
+print('RF Validation Confusion Matrix', confusionMatrix);
+print('RF Overall Validation Accuracy', confusionMatrix.accuracy());
+
+
+var crt_classifier = ee.Classifier.smileCart().train({      
+  features:training,
+  classProperty: 'id',
+  inputProperties: bands
+}); 
+
+
+//TRAINING METRICS FOR CRT
+var confusionMatrix = ee.ConfusionMatrix(training.classify(crt_classifier)
+                      .errorMatrix({
+                        actual: 'id',
+                        predicted: 'classification'
+                      }));
+print('CRT Training Confusion Matrix', confusionMatrix);
+print('CRT Overall Training Accuracy', confusionMatrix.accuracy());
+
+//VALIDATION METRICS FOR CRT
+var confusionMatrix = ee.ConfusionMatrix(validation.classify(crt_classifier)
+                      .errorMatrix({
+                        actual: 'id',
+                        predicted: 'classification'
+                      }));
+                  
+print('CRT Validation Confusion Matrix', confusionMatrix);
+print('CRT Overall Validation Accuracy', confusionMatrix.accuracy());
